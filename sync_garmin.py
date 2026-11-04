@@ -131,6 +131,22 @@ def main():
 
     # Guarda los datos en lotes pequeños.
     # Elimina duplicados antes de guardar.
+from collections import Counter
+
+keys = [
+    (record["record_type"], record["record_date"])
+    for record in records
+]
+
+duplicates = {
+    key: count
+    for key, count in Counter(keys).items()
+    if count > 1
+}
+
+logger.info("Registros recibidos: %s", len(records))
+logger.info("Claves duplicadas: %s", duplicates)
+
 unique_records = {}
 
 for record in records:
@@ -138,6 +154,8 @@ for record in records:
     unique_records[key] = record
 
 records = list(unique_records.values())
+
+logger.info("Registros después de deduplicar: %s", len(records))
 
 # Guarda los datos en lotes pequeños.
 for offset in range(0, len(records), 100):
