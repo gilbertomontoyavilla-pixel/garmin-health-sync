@@ -128,7 +128,27 @@ def main():
         raise RuntimeError(
             "No se obtuvieron datos. Revisa el registro de ejecución."
         )
+# Elimina duplicados antes de guardar.
+unique_records = {}
 
+for record in records:
+    key = (record["record_type"], record["record_date"])
+    unique_records[key] = record
+
+records = list(unique_records.values())
+
+logger.info(
+    "Registros después de deduplicar: %s",
+    len(records)
+)
+
+# Guarda los datos en lotes pequeños.
+for offset in range(0, len(records), 100):
+    batch = records[offset:offset + 100]
+    db.table("garmin_records").upsert(
+        batch,
+        on_conflict="record_type,record_date"
+    ).execute()
     # Guarda los datos en lotes pequeños.
     # Elimina duplicados antes de guardar.
 from collections import Counter
