@@ -130,12 +130,22 @@ def main():
         )
 
     # Guarda los datos en lotes pequeños.
-    for offset in range(0, len(records), 100):
-        batch = records[offset:offset + 100]
-        db.table("garmin_records").upsert(
-            batch,
-            on_conflict="record_type,record_date",
-        ).execute()
+    # Elimina duplicados antes de guardar.
+unique_records = {}
+
+for record in records:
+    key = (record["record_type"], record["record_date"])
+    unique_records[key] = record
+
+records = list(unique_records.values())
+
+# Guarda los datos en lotes pequeños.
+for offset in range(0, len(records), 100):
+    batch = records[offset:offset + 100]
+    db.table("garmin_records").upsert(
+        batch,
+        on_conflict="record_type,record_date"
+    ).execute()
 
     logger.info(
         "Sincronización finalizada: %s registros procesados",
