@@ -10,6 +10,8 @@ from garmin_personal_api import (
     PersonalApiAuthenticator,
 )
 
+SYNC_CODE_VERSION = "2026-11-03-v2"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
@@ -19,32 +21,54 @@ logger = logging.getLogger("garmin-sync")
 
 
 def normalize_date(value, fallback):
-    """Extrae una fecha YYYY-MM-DD de un valor Garmin."""
+    """Extrae una fecha válida en formato YYYY-MM-DD."""
     if not value:
         return fallback
 
     value = str(value)
 
-    if len(value) >= 10:
-        candidate = value[:10]
-        try:
-            date.fromisoformat(candidate)
-            return candidate
-        except ValueError:
-            pass
-
-    return fallback
+    try:
+        parsed_date = date.fromisoformat(value[:10])
+        return parsed_date.isoformat()
+    except (ValueError, TypeError):
+        return fallback
 
 
 def main():
-    # 1. Leer credenciales
+    logger.info("SYNC_CODE_VERSION=%s", SYNC_CODE_VERSION)
+
+    # 1. Validar credenciales
+    required_variables = [
+        "GARMIN_API_KEY",
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY",
+    ]
+
+    missing = [
+        name for name in required_variables
+        if not os.environ.get(name)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Faltan variables de entorno: " + ", ".join(missing)
+        )
+
     api_key = os.environ["GARMIN_API_KEY"]
-    supabase_url = os.environ["SUPABASE_URL"]
+    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
     supabase_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
+    # SUPABASE_URL debe ser la URL raíz del proyecto,
+    # sin /rest/v1 ni rutas adicionales.
+    if "/rest/v1" in supabase_url:
+        raise ValueError(
+            "SUPABASE_URL debe terminar en .supabase.co "
+            "y no contener /rest/v1."
+        )
 
     db = create_client(supabase_url, supabase_key)
 
-    # 2. Definir periodo de consulta
+    # 2. Consultar los últimos 7 días, incluido hoy
     today = date.today()
     start = today - timedelta(days=7)
 
@@ -53,22 +77,27 @@ def main():
 
     records = []
 
-    # 3. Preparar función para almacenar registros
     def add_record(record_type, record_date, payload):
+        """Añade un registro con la clave de conflicto de Supabase."""
         records.append({
             "record_type": record_type,
-            "record_date": str(record_date),
+            "record_date": normalize_date(record_date, end_date),
             "payload": payload,
             "synced_at": datetime.now(timezone.utc).isoformat(),
         })
 
-    # 4. Autenticación Garmin
+    # 3. Autenticación con Garmin
     logger.info("Autenticando con Garmin...")
 
     with PersonalApiAuthenticator() as auth:
         token = auth.obtain_token(api_key)
 
-    # 5. Consultar datos Garmin
+    if not getattr(token, "access_token", None):
+        raise RuntimeError(
+            "Garmin no devolvió un token de acceso válido."
+        )
+
+    # 4. Consultar los datos
     with GarminPersonalApiClient(token.access_token) as garmin:
 
         requests_to_make = [
@@ -129,12 +158,18 @@ def main():
 
                 if isinstance(result, list):
 
-                    # Agrupar actividades por día para no
-                    # perder varias actividades de una misma fecha.
                     if record_type == "activities":
+                        # Conservar todas las actividades del mismo día
+                        # en un único registro por fecha.
                         activities_by_date = defaultdict(list)
 
                         for item in result:
+                            if not isinstance(item, dict):
+                                logger.warning(
+                                    "Actividad ignorada: formato inesperado"
+                                )
+                                continue
+
                             item_date = normalize_date(
                                 item.get("startTimeLocal")
                                 or item.get("startTimeGMT")
@@ -144,15 +179,20 @@ def main():
 
                             activities_by_date[item_date].append(item)
 
-                        for activity_date, activities in activities_by_date.items():
+                        for activity_date, activities in (
+                            activities_by_date.items()
+                        ):
                             add_record(
-                                record_type,
+                                "activities",
                                 activity_date,
                                 {"activities": activities},
                             )
 
                     else:
                         for item in result:
+                            if not isinstance(item, dict):
+                                item = {"data": item}
+
                             item_date = normalize_date(
                                 item.get("calendarDate")
                                 or item.get("startTimeLocal")
@@ -167,11 +207,8 @@ def main():
                             )
 
                 elif isinstance(result, dict):
-                    add_record(
-                        record_type,
-                        end_date,
-                        result,
-                    )
+                    # La respuesta completa se guarda como un registro.
+                    add_record(record_type, end_date, result)
 
                 else:
                     add_record(
@@ -186,24 +223,24 @@ def main():
                 )
 
             except Exception:
+                # Permite que otras categorías se consulten aunque una falle.
                 logger.exception(
                     "Error consultando %s",
                     record_type,
                 )
 
-    # 6. Verificar que se obtuvieron datos
+    # 5. Validar los resultados
     if not records:
         raise RuntimeError(
             "No se obtuvieron datos de Garmin. "
-            "Revisa el registro de ejecución."
+            "Revisa los errores de autenticación y consulta anteriores."
         )
 
-    logger.info(
-        "Registros recibidos: %s",
-        len(records),
-    )
+    logger.info("Registros recibidos: %s", len(records))
 
-    # 7. Eliminar duplicados antes de guardar
+    # 6. Deduplicar por la clave única usada en Supabase.
+    # Si hay varias respuestas del mismo tipo y fecha, conservar
+    # el último registro generado para esa combinación.
     unique_records = {}
 
     for record in records:
@@ -211,24 +248,40 @@ def main():
             record["record_type"],
             record["record_date"],
         )
-
         unique_records[key] = record
 
     records = list(unique_records.values())
 
+    # Comprobación adicional: ningún lote debe contener dos claves iguales.
+    keys = [
+        (record["record_type"], record["record_date"])
+        for record in records
+    ]
+
+    if len(keys) != len(set(keys)):
+        raise RuntimeError(
+            "Se detectaron claves duplicadas después de deduplicar."
+        )
+
     logger.info(
-        "Registros después de deduplicar: %s",
+        "Registros únicos listos para Supabase: %s",
         len(records),
     )
 
-    # 8. Guardar en Supabase por lotes de 100
+    # 7. Guardar en Supabase por lotes de 100.
+    # Requiere una restricción UNIQUE en
+    # (record_type, record_date).
     for offset in range(0, len(records), 100):
         batch = records[offset:offset + 100]
 
-        db.table("garmin_records").upsert(
-            batch,
-            on_conflict="record_type,record_date",
-        ).execute()
+        response = (
+            db.table("garmin_records")
+            .upsert(
+                batch,
+                on_conflict="record_type,record_date",
+            )
+            .execute()
+        )
 
         logger.info(
             "Lote guardado: %s de %s",
