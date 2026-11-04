@@ -99,11 +99,12 @@ def main():
                 if isinstance(result, list):
                     for item in result:
                         item_date = (
-                            item.get("calendarDate")
-                            or item.get("startTimeLocal")
-                            or item.get("startTimeGMT")
-                            or end_date
-                        )
+    item.get("activityId")
+    or item.get("startTimeLocal")
+    or item.get("startTimeGMT")
+    or item.get("calendarDate")
+    or end_date
+)
                         add_record(record_type, item_date, item)
 
                 elif isinstance(result, dict):
